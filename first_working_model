@@ -1,0 +1,358 @@
+from __future__ import absolute_import
+from __future__ import division
+
+import argparse
+import logging
+import sys
+import time
+from datetime import datetime
+
+import tensorflow as tf
+import numpy as np
+
+import matplotlib
+import matplotlib.pyplot as plt
+
+from utils import Progbar, get_minibatches, get_debug_training_set, ConfusionMatrix
+from model import Model
+
+
+LABEL_ENUM_STR = {'unrelated': 0, 'agree': 1, 'disagree': 2, 'discuss': 3}
+LABEL_ENUM_INT = {0: 'unrelated', 1: 'agree', 2: 'disagree', 3: 'discuss'}
+
+
+class Config:
+    """Holds model hyperparams and data information.
+    The config class is used to store various hyperparameters and dataset
+    information parameters. Model objects are passed a Config() object at
+    instantiation. Use self.config.? instead of Config.?
+    """
+    n_classes = 4
+    n_features = 100
+    embed_size = 100 #GloVe feature dimension-load file depending on [100|200]
+    max_body_length = 400 # Length of sequence used for body
+    max_stance_length = 30 # Length of sequence used for stance
+    batch_size = 100
+    lstm_cell_size = 300
+    n_epochs = 100
+    lr = 0.01
+    max_grad_norm = 5.
+    if embed_size == 100:
+        embed_file = 'Data/glove_100d_embeddings.npy'
+    elif embed_size == 200:
+        embed_file = 'Data/glove_200d_embeddings.npy'
+    else:
+        raise "No embedding size of this dimension"
+
+class FakeNewsPredictor(Model):
+    def add_placeholders(self):
+        """Generates placeholder variables to represent the input tensors
+        NOTE: You do not have to do anything here.
+        """
+        self.body_inputs_placeholder = tf.placeholder(tf.int32, shape=(None, self.config.max_body_length), name="x_body")
+        self.stance_inputs_placeholder = tf.placeholder(tf.int32, shape=(None, self.config.max_stance_length), name="x_stance")
+        self.labels_placeholder = tf.placeholder(tf.int32, shape=(None), name="y")
+        self.body_length_placeholder = tf.placeholder(tf.int32, shape=(None), name="body_lengths")
+        self.stance_length_placeholder = tf.placeholder(tf.int32, shape=(None), name="stance_lengths")
+
+    def create_feed_dict(self, body_inputs_batch, stance_inputs_batch, body_length_batch, stance_length_batch, labels_batch=None):
+        """Creates the feed_dict for the model.
+        NOTE: You do not have to do anything here.
+        """
+        feed_dict = {
+            self.body_inputs_placeholder: body_inputs_batch,
+            self.stance_inputs_placeholder: stance_inputs_batch,
+            self.body_length_placeholder: body_length_batch,
+            self.stance_length_placeholder: stance_length_batch
+            }
+        if labels_batch is not None:
+            feed_dict[self.labels_placeholder] = labels_batch
+        return feed_dict
+
+    def add_embedding(self):
+        """Adds an embedding layer that maps from input tokens (integers) to vectors and then
+        concatenates those vectors:
+
+        TODO:
+            - Create an embedding tensor and initialize it with self.pretrained_embeddings.
+            - Use the input_placeholder to index into the embeddings tensor, resulting in a
+              tensor of shape (None, max_length, n_features, embedding_size).
+            - Concatenates the embeddings by reshaping the embeddings tensor to shape
+              (None, max_length, n_features * embedding_size).
+
+        HINTS:
+            - You might find tf.nn.embedding_lookup useful.
+            - You can use tf.reshape to concatenate the vectors. See
+              following link to understand what -1 in a shape means.
+              https://www.tensorflow.org/api_docs/python/array_ops/shapes_and_shaping#reshape.
+
+        Returns:
+            embeddings: tf.Tensor of shape (None, n_features*embed_size)
+        """
+        params = tf.Variable(self.pretrained_embeddings, dtype=tf.float32)
+        body_embeddings = tf.nn.embedding_lookup(params=params, ids=self.body_inputs_placeholder)
+        stance_embeddings = tf.nn.embedding_lookup(params=params, ids=self.stance_inputs_placeholder)
+        print("EMBEDDING SHAPES:")
+        print("Body: {}, Stance: {}".format(body_embeddings.get_shape(), stance_embeddings.get_shape()))
+        return body_embeddings, stance_embeddings
+
+    def add_prediction_op(self): 
+        """Runs an rnn on the input using TensorFlows's
+        @tf.nn.dynamic_rnn function, and returns the final state as a prediction.
+
+        TODO: 
+            - Call tf.nn.dynamic_rnn using @cell below. See:
+              https://www.tensorflow.org/api_docs/python/nn/recurrent_neural_networks
+            - Apply a sigmoid transformation on the final state to
+              normalize the inputs between 0 and 1.
+
+        Returns:
+            preds: tf.Tensor of shape (batch_size, 1)
+        """
+
+        #init MLP Layer variables
+        with tf.variable_scope('MLP_Layer') as scope:
+            W_b =  tf.get_variable('W_b',
+                                   shape=[Config.lstm_cell_size, Config.n_features],
+                                   initializer=tf.contrib.layers.xavier_initializer())
+            W_s = tf.get_variable('W_s',
+                                  shape=[Config.lstm_cell_size, Config.n_features],
+                                  initializer=tf.contrib.layers.xavier_initializer())
+            W1 = tf.get_variable('W1',
+                                 shape=[2*Config.n_features, 2*Config.n_features],
+                                 initializer=tf.contrib.layers.xavier_initializer())
+            b1 = tf.get_variable('b1',
+                                 shape=[1, 2*Config.n_features])
+            W2 = tf.get_variable('W2',
+                                 shape=[2*Config.n_features, 2*Config.n_features],
+                                 initializer=tf.contrib.layers.xavier_initializer())
+            b2 = tf.get_variable('b2',
+                                 shape=[1, 2*Config.n_features])
+            W3 = tf.get_variable('W3',
+                                 shape=[2*Config.n_features, Config.n_classes],
+                                 initializer=tf.contrib.layers.xavier_initializer())
+            b3 = tf.get_variable('b3',
+                                 shape=[1, Config.n_classes])
+        # Pick out the cell to use here.
+
+        body_cell = tf.nn.rnn_cell.LSTMCell(Config.lstm_cell_size)
+        body_initial_state = body_cell.zero_state(Config.batch_size, dtype=tf.float32)
+
+        stance_cell = tf.nn.rnn_cell.LSTMCell(Config.lstm_cell_size)
+        stance_initial_state = stance_cell.zero_state(Config.batch_size, dtype=tf.float32)
+        x_body, x_stance = self.add_embedding()
+        body_output, _ = tf.nn.dynamic_rnn(body_cell, x_body, initial_state=body_initial_state, scope="Body")
+        stance_output, _ = tf.nn.dynamic_rnn(stance_cell, x_stance, initial_state=stance_initial_state, scope="Stance")
+        print("LSTM OUTPUT SIZES:")
+        print("Body: {}, Stance: {}".format(body_output.get_shape(), stance_output.get_shape()))
+        body_out_size = int(body_output.get_shape()[2])
+        body_index = tf.range(0, Config.batch_size) * Config.max_body_length + (self.body_length_placeholder-1)
+        stance_out_size = int(stance_output.get_shape()[2])
+        stance_index = tf.range(0, Config.batch_size) * Config.max_stance_length + (self.stance_length_placeholder - 1)
+        body_flat = tf.reshape(body_output, [-1, body_out_size])
+        body_last = tf.gather(body_flat, body_index)
+        stance_flat = tf.reshape(stance_output, [-1, stance_out_size])
+        stance_last = tf.gather(stance_flat, stance_index)
+        #body_output = tf.transpose(body_output, [1, 0, 2])
+        #stance_output = tf.transpose(stance_output, [1, 0, 2])
+        #body_last = tf.gather(body_output, int(body_output.get_shape()[0]) - 1)
+        #stance_last = tf.gather(stance_output, int(stance_output.get_shape()[0]) - 1)
+        print("LSTM LAST OUTPUT SIZE:")
+        print("Body: {}, Stance: {}".format(body_last.get_shape(), stance_last.get_shape()))
+        output = tf.concat(1, [tf.matmul(body_last, W_b), tf.matmul(stance_last, W_s)])
+        mlp1 = tf.nn.tanh(tf.matmul(output, W1) + b1)
+        mlp2 = tf.nn.tanh(tf.matmul(mlp1, W2) + b2)
+        pred = tf.nn.tanh(tf.matmul(mlp2, W3) + b3)
+        return pred
+
+    def add_loss_op(self, pred):
+
+        y = self.labels_placeholder
+
+        loss = tf.reduce_mean(tf.nn.sparse_softmax_cross_entropy_with_logits(pred, y))
+
+        return loss
+
+    def add_training_op(self, loss):
+        """Sets up the training Ops.
+
+        Creates an optimizer and applies the gradients to all trainable variables.
+        The Op returned by this function is what must be passed to the
+        `sess.run()` call to cause the model to train. See
+
+        TODO:
+            - Get the gradients for the loss from optimizer using
+              optimizer.compute_gradients.
+            - if self.clip_gradients is true, clip the global norm of
+              the gradients using tf.clip_by_global_norm to self.config.max_grad_norm
+            - Compute the resultant global norm of the gradients using
+              tf.global_norm and save this global norm in self.grad_norm.
+            - Finally, actually create the training operation by calling
+              optimizer.apply_gradients.
+        See: https://www.tensorflow.org/api_docs/python/train/gradient_clipping
+        Args:
+            loss: Loss tensor.
+        Returns:
+            train_op: The Op for training.
+        """
+
+        train_op = tf.train.AdamOptimizer(learning_rate=Config.lr).minimize(loss)
+
+        return train_op
+
+    def train_on_batch(self, sess, body_inputs_batch, stance_inputs_batch, body_length_batch, stance_length_batch, labels_batch):
+        """Perform one step of gradient descent on the provided batch of data.
+        This version also returns the norm of gradients.
+        """
+
+        feed = self.create_feed_dict(body_inputs_batch,
+                                     stance_inputs_batch,
+                                     body_length_batch,
+                                     stance_length_batch,
+                                     labels_batch=labels_batch)
+        _, loss = sess.run([self.train_op, self.loss], feed_dict=feed)
+        return loss
+
+    def run_epoch(self, sess, debug=False):
+
+        losses, grad_norms = [], []
+        if debug:
+            batch = get_debug_training_set(Config.batch_size, Config.max_body_length, Config.max_stance_length)
+            for b in batch:
+
+                loss = self.train_on_batch(sess, b['bodies'],
+                                           b['stances'], b['body_len'],
+                                           b['stance_len'], b['labels'])
+
+                print("Debug batch training loss: {}".format(loss))
+                losses.append(loss)
+
+            dev_batch = get_minibatches(Config.batch_size, Config.max_body_length, Config.max_stance_length, False, 'Dev')[0:2]
+            preds = []
+            labels = []
+
+            for dev_b in dev_batch:
+
+                preds.append(self.predict_on_batch(sess, dev_b['bodies'],
+                                                   dev_b['stances'], dev_b['body_len'],
+                                                   dev_b['stance_len']).tolist())
+
+                labels.append(dev_b['labels'].tolist())
+
+            predictions, labels = self.consolidate_predictions(preds, labels)
+            for p, l in zip(predictions, labels):
+                print(p, l)
+
+        else:
+            batches = get_minibatches(Config.batch_size, Config.max_body_length, Config.max_stance_length)
+            print("Training on Epoch...")
+            prog = Progbar(target=int(len(batches)))
+            for i, batch in enumerate(batches):
+
+                loss = self.train_on_batch(sess, batch['bodies'],
+                                           batch['stances'], batch['body_len'],
+                                           batch['stance_len'], batch['labels'])
+                losses.append(loss)
+
+                prog.update(i + 1, [("train loss", loss)])
+            dev_batch = get_minibatches(Config.batch_size, Config.max_body_length, Config.max_stance_length, False,
+                                            'Dev')
+            preds = []
+            labels = []
+            print("Making predictions of dev set...")
+            prog = Progbar(target=int(len(dev_batch)))
+            i = 0
+            for dev_b in dev_batch:
+                preds.append(self.predict_on_batch(sess, dev_b['bodies'],
+                                                   dev_b['stances'], dev_b['body_len'],
+                                                   dev_b['stance_len']).tolist())
+                labels.append(dev_b['labels'].tolist())
+                prog.update(i, [("Predictions", 000)])
+                i += 1
+            predictions, labels = self.consolidate_predictions(preds, labels)
+            dev_acc = self.evaluate_accuracy(predictions, labels)
+            conf_mat = ConfusionMatrix(LABEL_ENUM_INT.values())
+            for pred, lab in zip(predictions, labels):
+                conf_mat.update(lab, pred)
+            print(conf_mat.as_table())
+            print(conf_mat.summary())
+
+
+        return losses, grad_norms
+
+    def fit(self, sess, debug=False):
+        losses, grad_norms = [], []
+        for epoch in range(self.config.n_epochs):
+            print("Running Epoch {} of {}:".format(epoch+1, Config.n_epochs))
+            loss, grad_norm = self.run_epoch(sess, debug=debug)
+            losses.append(loss)
+            #print("Loss at end of epoch: {}".format(loss))
+
+        return losses, grad_norms
+
+    def predict_on_batch(self, sess, inputs_body_batch, inputs_stance_batch, body_length_batch, stance_length_batch):
+        """Make predictions for the provided batch of data
+
+        Args:
+            sess: tf.Session()
+            input_batch: np.ndarray of shape (n_samples, n_features)
+        Returns:
+            predictions: np.ndarray of shape (n_samples, n_classes)
+        """
+        feed = self.create_feed_dict(inputs_body_batch, inputs_stance_batch, body_length_batch, stance_length_batch)
+        predictions = sess.run(tf.argmax(self.pred, axis=1), feed_dict=feed)
+        return predictions
+
+    @staticmethod
+    def consolidate_predictions(prediction_batches, labels_batches):
+        predictions = []
+        labels = []
+        for preds, labs in zip(prediction_batches, labels_batches):
+            predictions += preds
+            labels += labs
+        return predictions, labels
+
+    @staticmethod
+    def evaluate_accuracy(predictions, labels):
+        dev_total = 0
+        unrelated_acc_count = 0
+        related_acc_count = 0
+        related_total = 0
+
+        for pred, lab in zip(predictions, labels):
+            dev_total += 1
+            if lab > 0:
+                related_total += 1
+                if pred == lab:
+                    related_acc_count += 1
+                if pred > 0:
+                    unrelated_acc_count += 1
+            if lab == 0:
+                if pred == 0:
+                    unrelated_acc_count += 1
+
+        accuracy = 0.25*unrelated_acc_count/dev_total + .75 * related_acc_count/related_total
+        print("")
+        print("")
+        print("Unrelated/Related Accuracy: {}%".format(float(unrelated_acc_count)/dev_total*100))
+        print("Related Class Accuracy: {}%".format(float(related_acc_count)/related_total*100))
+        print("Weighted accuracy score: {}%".format(accuracy*100))
+        print("")
+        return accuracy
+
+    def __init__(self, config):
+        self.config = config
+        self.inputs_placeholder = None
+        self.labels_placeholder = None
+        self.pretrained_embeddings = np.load(Config.embed_file)
+        self.grad_norm = None
+        self.build()
+
+
+
+if __name__ == "__main__":
+    model = FakeNewsPredictor(Config)
+    init = tf.global_variables_initializer()
+    with tf.Session() as sess:
+        sess.run(init)
+        model.fit(sess, debug=False)
